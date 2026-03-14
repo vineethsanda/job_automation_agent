@@ -49,7 +49,7 @@ echo "✓ Dependencies installed"
 # Install Playwright browsers
 echo ""
 echo "Installing Playwright browsers..."
-python3 -m playwright install chromium --quiet
+python3 -m playwright install chromium 
 echo "✓ Playwright browsers installed"
 
 # Create directories

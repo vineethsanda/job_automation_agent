@@ -1,0 +1,38 @@
+# Python environment
+venv/
+env/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Agent-specific
+logs/
+*.log
+/tmp/linkedin_session/
+~/.llm_agent/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.log
+
+# Build
+dist/
+build/
+*.egg

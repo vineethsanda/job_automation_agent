@@ -26,29 +26,33 @@ class OllamaClient:
         system: Optional[str] = None,
         json_format: bool = False,
     ) -> str:
-        """Generate text using Ollama."""
+        """Generate text using Ollama (using /api/chat endpoint)."""
         try:
+            # Use new /api/chat endpoint (compatible with all Ollama versions)
             payload = {
                 "model": self.model,
-                "prompt": prompt,
+                "messages": [
+                    {"role": "system", "content": system} if system else None,
+                    {"role": "user", "content": prompt}
+                ],
                 "stream": False,
                 "keep_alive": "5m",
             }
-
-            if system:
-                payload["system"] = system
+            
+            # Remove None values
+            payload["messages"] = [m for m in payload["messages"] if m is not None]
 
             if json_format:
                 payload["format"] = "json"
 
             response = await self.client.post(
-                f"{self.base_url}/api/generate",
+                f"{self.base_url}/api/chat",
                 json=payload,
             )
             response.raise_for_status()
 
             result = response.json()
-            text = result.get("response", "").strip()
+            text = result.get("message", {}).get("content", "").strip()
             logger.debug(f"Generated text (length: {len(text)})")
             return text
 

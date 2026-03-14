@@ -5,12 +5,15 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from loguru import logger
 
-from utils.imap_client import GmailIMAPClient, GmailSMTPClient
+
+from utils.imap_client import GmailIMAPClient
 from utils.smtp_client import SMTPClientWrapper
 from tools.fetch_unread import fetch_unread_emails
 from tools.send_reply import send_reply
 from tools.read_thread import read_thread
 from tools.extract_otp import extract_otp
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # Initialize FastMCP server

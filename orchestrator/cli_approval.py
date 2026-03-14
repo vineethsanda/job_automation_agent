@@ -2,7 +2,8 @@
 
 from typing import Optional, Dict
 from loguru import logger
-
+from dotenv import load_dotenv
+load_dotenv()
 
 class CLIApprovalInterface:
     """Handle CLI-based approval for job applications."""

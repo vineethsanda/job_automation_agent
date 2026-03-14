@@ -7,14 +7,20 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
-from loguru import logger
+from dotenv import load_dotenv
+load_dotenv()
 
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from loguru import logger
 from config.models import SystemConfig, CLIApprovalConfig, MetadataContent
 from orchestrator.cli_approval import CLIApprovalInterface
 from utils.encryption import ConfigEncryption
 from utils.deduplication import JobDeduplicator
 from utils.state_machine import JobStateMachine, JobState
 from utils.ollama_client import OllamaClient
+from mcp_clients.gmail_client import GmailMCPClient
 
 
 class JobAutomationOrchestrator:
@@ -41,6 +47,11 @@ class JobAutomationOrchestrator:
 
         # Metadata cache
         self.metadata: Optional[MetadataContent] = None
+        
+        # Email monitoring
+        self.last_email_check_time: Optional[datetime] = None
+        self.monitored_emails: List[Dict[str, Any]] = []
+        self.email_monitor_task: Optional[asyncio.Task] = None
 
         self._setup_logging()
 
@@ -96,12 +107,17 @@ class JobAutomationOrchestrator:
     async def initialize_mcp_servers(self) -> bool:
         """Initialize connections to MCP servers."""
         try:
-            # Note: In production, use mcp.ClientSession to connect
-            # For now, we'll use placeholder implementations
-            logger.info("MCP server initialization skipped (placeholder mode)")
-            logger.info(
-                "Configure MCP_SERVERS environment variable for production use"
-            )
+            logger.info("🔌 Initializing MCP servers...")
+            
+            # Initialize Gmail MCP Client
+            self.gmail_mcp = GmailMCPClient()
+            gmail_connected = await self.gmail_mcp.connect()
+            
+            if not gmail_connected:
+                logger.error("Failed to connect to Gmail MCP")
+                return False
+            
+            logger.info("✅ MCP servers initialized successfully")
             return True
 
         except Exception as e:
@@ -137,22 +153,43 @@ class JobAutomationOrchestrator:
     async def check_emails_for_opportunities(self) -> List[Dict[str, Any]]:
         """Check emails for job opportunities and recruiter messages."""
         try:
-            logger.info("Checking emails for job opportunities...")
+            logger.info("📨 Checking emails for job opportunities...")
 
-            # This would call the gmail_mcp server in production
-            # For now, return mock data
-            opportunities = [
-                {
-                    "job_id": "email_001",
-                    "from": "recruiter@company.com",
-                    "company": "DataSystems",
-                    "role": "ML Engineer",
-                    "message": "We think you'd be great for...",
-                    "received_at": datetime.utcnow().isoformat(),
+            if not self.gmail_mcp or not self.gmail_mcp.is_connected:
+                logger.error("Gmail MCP not connected")
+                return []
+
+            # Fetch unread emails from Gmail
+            result = await self.gmail_mcp.fetch_unread_emails(
+                mailbox="INBOX",
+                max_results=10
+            )
+
+            if result["status"] != "success":
+                logger.warning(f"Failed to fetch emails: {result.get('error')}")
+                return []
+
+            emails = result.get("emails", [])
+            opportunities = []
+
+            for email in emails:
+                # Extract recruiter/opportunity information from email
+                opportunity = {
+                    "job_id": f"email_{email.get('msg_id', 'unknown')}",
+                    "from": email.get("from", ""),
+                    "subject": email.get("subject", ""),
+                    "body": email.get("body", ""),
+                    "date": email.get("date", ""),
+                    "timestamp": email.get("timestamp", ""),
+                    "source": "email",
+                    # These would normally be extracted from the email content using NLP
+                    "company": self._extract_company_from_email(email),
+                    "role": self._extract_role_from_email(email),
+                    "message": email.get("body", "")[:200],  # First 200 chars
                 }
-            ]
+                opportunities.append(opportunity)
 
-            logger.info(f"Found {len(opportunities)} email opportunities")
+            logger.info(f"✉️  Found {len(opportunities)} email opportunities")
             return opportunities
 
         except Exception as e:
@@ -210,33 +247,11 @@ class JobAutomationOrchestrator:
 
             logger.info(f"Processing {len(pending)} pending approvals...")
 
-            # Batch action prompt
-            batch_action = CLIApprovalInterface.prompt_batch_action(len(pending))
-
-            if batch_action == "approve_all":
-                for job in pending:
-                    self.state_machine.update_state(job.job_id, JobState.APPROVED)
-                    await self.process_approved_job(job)
-
-            elif batch_action == "reject_all":
-                for job in pending:
-                    self.state_machine.update_state(job.job_id, JobState.FAILED)
-
-            elif batch_action == "manual":
-                for job in pending:
-                    approved = CLIApprovalInterface.prompt_approval(
-                        job.job_id,
-                        job.company,
-                        job.role,
-                        job.url,
-                        job.metadata,
-                    )
-
-                    if approved:
-                        self.state_machine.update_state(job.job_id, JobState.APPROVED)
-                        await self.process_approved_job(job)
-                    else:
-                        self.state_machine.update_state(job.job_id, JobState.FAILED)
+            # Auto-approve all pending jobs
+            for job in pending:
+                logger.info(f"✅ Auto-approving: {job.company}/{job.role}")
+                self.state_machine.update_state(job.job_id, JobState.APPROVED)
+                await self.process_approved_job(job)
 
         except Exception as e:
             logger.error(f"Approval processing error: {e}")
@@ -279,26 +294,46 @@ class JobAutomationOrchestrator:
 
     async def handle_email_response(self, job) -> None:
         """Handle recruiter email response."""
-        logger.info(f"Generating response to: {job.metadata.get('from')}")
+        recruiter_email = job.metadata.get('from', 'Unknown')
+        logger.info(f"📧 Generating response to: {recruiter_email}")
 
         # Generate personalized response using Ollama
         if not self.metadata:
             logger.warning("Metadata not loaded, skipping email response")
             return
 
-        prompt = self._build_email_prompt(job)
+        if not self.gmail_mcp or not self.gmail_mcp.is_connected:
+            logger.error("Gmail MCP not connected, cannot send reply")
+            return
 
-        response_text = await self.ollama_client.generate(
-            prompt,
-            system="You are a professional job seeker responding to recruiter emails. "
-            "Be concise, professional, and interested.",
-        )
+        try:
+            prompt = self._build_email_prompt(job)
 
-        logger.info(f"Generated response length: {len(response_text)} chars")
+            response_text = await self.ollama_client.generate(
+                prompt,
+                system="You are a professional job seeker responding to recruiter emails. "
+                "Be concise, professional, and interested.",
+            )
 
-        # In production, this would:
-        # 1. Call gmail_mcp to send email reply
-        # 2. Update job application status
+            logger.info(f"Generated response: {len(response_text)} chars")
+
+            # Send the email reply via Gmail MCP
+            subject = job.metadata.get('subject', f"Re: {job.company} - {job.role}")
+            
+            send_result = await self.gmail_mcp.send_email_reply(
+                to_address=recruiter_email,
+                subject=subject,
+                body=response_text,
+                original_message_id=job.metadata.get('msg_id'),
+            )
+
+            if send_result["status"] == "success":
+                logger.info(f"✅ Email reply sent successfully to {recruiter_email}")
+            else:
+                logger.error(f"❌ Failed to send email reply: {send_result.get('error')}")
+
+        except Exception as e:
+            logger.error(f"Error handling email response: {e}")
 
     async def handle_generic_application(self, job) -> None:
         """Handle generic job application."""
@@ -310,31 +345,76 @@ class JobAutomationOrchestrator:
         # 3. Fill form with prepared data
         # 4. Submit application
 
+    def _extract_company_from_email(self, email: Dict[str, Any]) -> str:
+        """Extract company name from email subject/body using heuristics."""
+        import re
+        
+        subject = email.get("subject", "")
+        sender = email.get("from", "").lower()
+        
+        # Look for "at [Company]" pattern
+        match = re.search(r'at\s+([A-Z][a-zA-Z0-9\s]+?)(?:\s|,|$)', subject)
+        if match:
+            return match.group(1).strip()
+        
+        # Extract domain from sender email
+        domain_match = re.search(r'@([a-zA-Z0-9.-]+)', sender)
+        if domain_match:
+            domain = domain_match.group(1)
+            company_name = domain.split('.')[0].capitalize()
+            return company_name
+        
+        return "Unknown Company"
+
+    def _extract_role_from_email(self, email: Dict[str, Any]) -> str:
+        """Extract job role from email subject/body using heuristics."""
+        import re
+        
+        subject = email.get("subject", "")
+        body = email.get("body", "")[:500]  # First 500 chars
+        
+        # Simple heuristics - look for common job title patterns
+        roles = [
+            "Software Engineer", "Data Scientist", "ML Engineer", "Product Manager",
+            "Frontend Developer", "Backend Developer", "Full Stack Engineer",
+            "DevOps Engineer", "Cloud Engineer", "Solutions Architect",
+            "Senior Engineer", "Lead Engineer", "Tech Lead"
+        ]
+        
+        for role in roles:
+            if role.lower() in subject.lower() or role.lower() in body.lower():
+                return role
+        
+        # Default extraction from subject
+        match = re.search(r':\s*([^-,]+?)(?:-|,|$)', subject)
+        if match:
+            return match.group(1).strip()
+        
+        return "Engineering Position"
+
     def _build_email_prompt(self, job) -> str:
         """Build LLM prompt for email generation."""
         if not self.metadata:
             return ""
 
-        thread_context = job.metadata.get("thread", [])
-
         prompt = f"""
-        Generate a professional job inquiry response email based on:
+Generate a professional job inquiry response email based on:
 
-        Recruiter: {job.metadata.get('from', 'Unknown')}
-        Company: {job.company}
-        Position: {job.role}
+Recruiter: {job.metadata.get('from', 'Unknown')}
+Company: {job.company}
+Position: {job.role}
 
-        Your Profile:
-        - Name: {self.metadata.personal_info.name}
-        - Email: {self.metadata.personal_info.email}
-        - Skills: {', '.join(self.metadata.skills)}
+Your Profile:
+- Name: {self.metadata.personal_info.name}
+- Email: {self.metadata.personal_info.email}
+- Skills: {', '.join(self.metadata.skills)}
 
-        Previous Message:
-        {json.dumps(thread_context, indent=2)}
+Original Message:
+{job.metadata.get('body', 'No body provided')[:500]}
 
-        Write a 2-3 paragraph response expressing interest, highlighting relevant skills,
-        and requesting next steps. Keep it professional and concise.
-        """
+Write a concise 2-3 paragraph response expressing interest, highlighting relevant skills,
+and requesting next steps. Be professional and enthusiastic. Do NOT include greeting or closing lines.
+"""
 
         return prompt
 
@@ -363,6 +443,103 @@ class JobAutomationOrchestrator:
         except Exception as e:
             logger.error(f"Approval loop error: {e}")
 
+    async def monitor_emails_background(self, check_interval: int = 30) -> None:
+        """
+        Background task to continuously monitor for new emails.
+        
+        Args:
+            check_interval: Seconds between email checks (default 30)
+        """
+        try:
+            logger.info(f"🔔 Email monitor started (checking every {check_interval}s)")
+            
+            while True:
+                try:
+                    if not self.gmail_mcp or not self.gmail_mcp.is_connected:
+                        logger.warning("Gmail MCP not connected, skipping email check")
+                        await asyncio.sleep(check_interval)
+                        continue
+                    
+                    # Check for unread emails
+                    result = await self.gmail_mcp.fetch_unread_emails(
+                        mailbox="INBOX",
+                        max_results=5
+                    )
+                    
+                    if result["status"] == "success":
+                        new_emails = result.get("emails", [])
+                        
+                        # Filter out emails we've already seen
+                        for email in new_emails:
+                            email_id = email.get("msg_id")
+                            if not any(e.get("msg_id") == email_id for e in self.monitored_emails):
+                                logger.info(f"📬 New email detected from {email.get('from', 'Unknown')}")
+                                self.monitored_emails.append(email)
+                                
+                                # Trigger job detection for new email
+                                await self.process_new_email(email)
+                    
+                    self.last_email_check_time = datetime.utcnow()
+                    await asyncio.sleep(check_interval)
+                    
+                except Exception as e:
+                    logger.error(f"Error in email monitoring loop: {e}")
+                    await asyncio.sleep(check_interval)
+                    
+        except asyncio.CancelledError:
+            logger.info("Email monitor task cancelled")
+
+    async def process_new_email(self, email: Dict[str, Any]) -> None:
+        """
+        Process a newly received email as a potential job opportunity.
+        
+        Args:
+            email: Email dict with subject, body, from, etc.
+        """
+        try:
+            # Extract job details from email
+            opportunity = {
+                "job_id": f"email_{email.get('msg_id', 'unknown')}",
+                "from": email.get("from", ""),
+                "subject": email.get("subject", ""),
+                "body": email.get("body", ""),
+                "date": email.get("date", ""),
+                "timestamp": email.get("timestamp", ""),
+                "source": "email",
+                "company": self._extract_company_from_email(email),
+                "role": self._extract_role_from_email(email),
+                "message": email.get("body", "")[:200],
+            }
+            
+            # Check for duplicates
+            company = opportunity.get("company", "Unknown")
+            role = opportunity.get("role", "Unknown")
+            
+            if self.deduplicator.is_duplicate(company, role):
+                logger.debug(f"Skipping duplicate email: {company}/{role}")
+                return
+            
+            # Create job in state machine
+            new_job = self.state_machine.create_job(
+                job_id=opportunity["job_id"],
+                company=company,
+                role=role,
+                url=None,
+                source="email",
+                metadata=opportunity,
+            )
+            
+            # Add to deduplication cache
+            self.deduplicator.add_job(company, role)
+            
+            # Transition to CLI_PENDING for approval
+            self.state_machine.update_state(opportunity["job_id"], JobState.CLI_PENDING)
+            
+            logger.info(f"✨ New job opportunity detected: {company} - {role}")
+            
+        except Exception as e:
+            logger.error(f"Error processing new email: {e}")
+
     async def main(self) -> None:
         """Main orchestrator entry point."""
         try:
@@ -370,20 +547,29 @@ class JobAutomationOrchestrator:
             logger.info("🤖 JOB AUTOMATION ORCHESTRATOR STARTING")
             logger.info("=" * 70)
 
+            # Initialize MCP servers FIRST (before metadata)
+            logger.info("Initializing MCP servers...")
+            if not await self.initialize_mcp_servers():
+                logger.warning("Failed to initialize MCP servers - EmailMonitor will skip checks")
+            else:
+                logger.info("✅ MCP servers initialized")
+
             # Load configuration
             logger.info("Loading encrypted metadata...")
             if not await self.load_metadata():
-                logger.error("Failed to load metadata, exiting")
-                return
-
-            # Initialize MCP servers
-            logger.info("Initializing MCP servers...")
-            if not await self.initialize_mcp_servers():
-                logger.error("Failed to initialize MCP servers")
-                # Continue anyway in development mode
+                logger.warning("Metadata not loaded - email replies disabled (approval still works)")
+            else:
+                logger.info("✅ Metadata loaded successfully")
 
             logger.info("✅ Orchestrator ready")
             logger.info("")
+            
+            # Start background email monitoring task
+            if self.gmail_mcp and self.gmail_mcp.is_connected:
+                logger.info("Starting email monitoring...")
+                self.email_monitor_task = asyncio.create_task(self.monitor_emails_background(check_interval=30))
+            else:
+                logger.warning("⚠️  Gmail not connected - email monitoring disabled")
 
             # Run main loop
             await self.run_approval_loop()
@@ -392,6 +578,15 @@ class JobAutomationOrchestrator:
             logger.error(f"Fatal error: {e}", exc_info=True)
         finally:
             # Cleanup
+            if self.email_monitor_task:
+                self.email_monitor_task.cancel()
+                try:
+                    await self.email_monitor_task
+                except asyncio.CancelledError:
+                    pass
+            
+            if self.gmail_mcp:
+                await self.gmail_mcp.disconnect()
             await self.ollama_client.close()
             logger.info("Orchestrator shutdown complete")
 

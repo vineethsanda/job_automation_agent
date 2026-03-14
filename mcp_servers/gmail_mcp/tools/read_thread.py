@@ -2,6 +2,8 @@
 
 from typing import Dict, Optional
 from loguru import logger
+from dotenv import load_dotenv
+load_dotenv()
 
 
 async def read_thread(

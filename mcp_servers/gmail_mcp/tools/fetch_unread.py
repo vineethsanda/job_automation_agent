@@ -2,6 +2,8 @@
 
 from typing import List, Dict
 from loguru import logger
+from dotenv import load_dotenv
+load_dotenv()
 
 
 async def fetch_unread_emails(

@@ -5,7 +5,7 @@ import json
 from base64 import b64encode, b64decode
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from typing import Any, Dict
 from loguru import logger
 
@@ -32,7 +32,7 @@ class ConfigEncryption:
         with open(self.salt_file, "rb") as f:
             salt = f.read()
 
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,

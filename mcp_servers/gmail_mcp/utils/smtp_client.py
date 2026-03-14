@@ -5,7 +5,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional
 from loguru import logger
-
+from dotenv import load_dotenv
+load_dotenv()
 
 class SMTPClientWrapper:
     """High-level SMTP wrapper for Gmail."""

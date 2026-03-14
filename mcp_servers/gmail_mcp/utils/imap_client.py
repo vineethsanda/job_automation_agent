@@ -10,6 +10,8 @@ from typing import List, Dict, Optional, Tuple
 from loguru import logger
 from datetime import datetime, timedelta
 import time
+from dotenv import load_dotenv
+load_dotenv()
 
 
 class GmailIMAPClient:
