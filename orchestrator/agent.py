@@ -21,6 +21,7 @@ from utils.deduplication import JobDeduplicator
 from utils.state_machine import JobStateMachine, JobState
 from utils.ollama_client import OllamaClient
 from mcp_clients.gmail_client import GmailMCPClient
+from mcp_clients.linkedin_client import LinkedInMCPClient
 
 
 class JobAutomationOrchestrator:
@@ -122,6 +123,15 @@ class JobAutomationOrchestrator:
                 logger.error("Failed to connect to Gmail MCP")
                 return False
             
+            # Initialize LinkedIn MCP Client
+            self.linkedin_mcp = LinkedInMCPClient()
+            linkedin_connected = await self.linkedin_mcp.connect()
+            
+            if not linkedin_connected:
+                logger.warning("⚠️  Failed to connect to LinkedIn MCP - LinkedIn discovery disabled")
+            else:
+                logger.info("✅ LinkedIn connected")
+            
             logger.info("✅ MCP servers initialized successfully")
             return True
 
@@ -130,35 +140,43 @@ class JobAutomationOrchestrator:
             return False
 
     async def run_linkedin_discovery(self) -> List[Dict[str, Any]]:
-        """Discover jobs from LinkedIn using stealth automation."""
+        """Discover jobs from LinkedIn using the LinkedIn MCP server."""
         try:
             logger.info("Starting LinkedIn job discovery...")
 
-            # This would call the linkedin_mcp server in production
-            # For now, return mock data
-            jobs = [
-                {
-                    "job_id": "li_001",
-                    "title": "Senior Software Engineer",
-                    "company": "TechCorp",
-                    "location": "San Francisco, CA",
-                    "url": "https://linkedin.com/jobs/view/12345",
-                    "salary": "$150k-$200k",
-                    "posted_date": datetime.utcnow().isoformat(),
-                }
-            ]
+            if not self.linkedin_mcp or not self.linkedin_mcp.is_connected:
+                logger.warning("LinkedIn MCP not connected, skipping LinkedIn discovery")
+                return []
+
+            # Fetch jobs from LinkedIn MCP
+            result = await self.linkedin_mcp.fetch_jobs(
+                search_query="Software Engineer",  # Can be customized
+                max_results=10
+            )
+
+            if result["status"] != "success":
+                logger.warning(f"Failed to fetch LinkedIn jobs: {result.get('error')}")
+                return []
+
+            jobs = result.get("posts", [])
             
             # Filter jobs posted after agent startup for automatic handling
             new_jobs = []
             if self.agent_start_time:
                 for job in jobs:
-                    posted_date = datetime.fromisoformat(job["posted_date"])
+                    posted_date_str = job.get("timestamp", "")
+                    try:
+                        posted_date = datetime.fromisoformat(posted_date_str) if posted_date_str else datetime.utcnow()
+                    except (ValueError, TypeError):
+                        posted_date = datetime.utcnow()
+                    
                     if posted_date >= self.agent_start_time:
                         job["is_new"] = True  # Mark as new for auto-reply
                         new_jobs.append(job)
                     else:
                         job["is_new"] = False
                         new_jobs.append(job)
+                        
                 logger.info(f"Found {len([j for j in new_jobs if j.get('is_new')])} new jobs posted after agent startup")
             else:
                 # If agent start time not set, mark all as new
@@ -420,10 +438,23 @@ Start with "Dear Hiring Manager," and end with your name.
 
             logger.info(f"Generated email: {len(email_body)} chars")
 
-            # Extract company domain to find recruiter email
-            # In production, this would use LinkedIn scraping or job portal data
-            company_domain = job.metadata.get("company_domain", f"{job.company.lower().replace(' ', '')}.com")
-            recruiter_email = f"careers@{company_domain}"
+            # Extract recruiter email from LinkedIn job posting
+            recruiter_email = None
+            if self.linkedin_mcp and self.linkedin_mcp.is_connected:
+                logger.debug("Extracting recruiter email from LinkedIn job posting...")
+                recruiter_email = await self.linkedin_mcp.extract_recruiter_email(job.metadata)
+            
+            # Fallback to guessing if extraction fails
+            if not recruiter_email:
+                logger.debug("Generating candidate recruiter emails...")
+                company_domain = job.metadata.get("company_domain")
+                if not company_domain:
+                    # Try to extract domain from company name
+                    company_domain = f"{job.company.lower().replace(' ', '')}.com"
+                recruiter_email = f"careers@{company_domain}"
+                logger.info(f"Using guessed recruiter email: {recruiter_email}")
+            else:
+                logger.info(f"Extracted recruiter email from LinkedIn: {recruiter_email}")
             
             # Send email via Gmail
             subject = f"Inquiry: {job.role} Position at {job.company}"
