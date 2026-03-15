@@ -52,6 +52,9 @@ class JobAutomationOrchestrator:
         self.last_email_check_time: Optional[datetime] = None
         self.monitored_emails: List[Dict[str, Any]] = []
         self.email_monitor_task: Optional[asyncio.Task] = None
+        
+        # Agent start time - used to identify new emails/jobs arriving after startup
+        self.agent_start_time: Optional[datetime] = None
 
         self._setup_logging()
 
@@ -80,28 +83,30 @@ class JobAutomationOrchestrator:
         logger.info("Logging configured")
 
     async def load_metadata(self) -> bool:
-        """Load and decrypt metadata JSON from file."""
+        """Load personal configuration from JSON file (no encryption needed)."""
         try:
-            metadata_path = Path(self.config.metadata_file)
-
-            if not metadata_path.exists():
-                logger.error(f"Metadata file not found: {metadata_path}")
+            # Try to load from project personal_config.json first
+            config_path = Path(__file__).parent.parent / "config" / "personal_config.json"
+            
+            if not config_path.exists():
+                logger.error(f"Config file not found: {config_path}")
                 return False
 
-            # Prompt for master password
-            password = ConfigEncryption.prompt_master_password()
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
 
-            with open(metadata_path, "r") as f:
-                encrypted_data = f.read()
+            self.metadata = MetadataContent(**config_data)
 
-            decrypted_data = self.encryption.decrypt_metadata(encrypted_data, password)
-            self.metadata = MetadataContent(**decrypted_data)
+            # Validate that personal info is properly configured
+            if self.metadata.personal_info.name == "Your Name":
+                logger.warning("⚠️  personal_config.json has placeholder values - please update with your actual info")
+                logger.warning("   Edit: config/personal_config.json and update name, email, phone, etc.")
 
-            logger.info(f"Metadata loaded successfully")
+            logger.info(f"✅ Personal configuration loaded successfully")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load metadata: {e}")
+            logger.error(f"Failed to load personal configuration: {e}")
             return False
 
     async def initialize_mcp_servers(self) -> bool:
@@ -142,9 +147,27 @@ class JobAutomationOrchestrator:
                     "posted_date": datetime.utcnow().isoformat(),
                 }
             ]
+            
+            # Filter jobs posted after agent startup for automatic handling
+            new_jobs = []
+            if self.agent_start_time:
+                for job in jobs:
+                    posted_date = datetime.fromisoformat(job["posted_date"])
+                    if posted_date >= self.agent_start_time:
+                        job["is_new"] = True  # Mark as new for auto-reply
+                        new_jobs.append(job)
+                    else:
+                        job["is_new"] = False
+                        new_jobs.append(job)
+                logger.info(f"Found {len([j for j in new_jobs if j.get('is_new')])} new jobs posted after agent startup")
+            else:
+                # If agent start time not set, mark all as new
+                for job in jobs:
+                    job["is_new"] = True
+                new_jobs = jobs
 
-            logger.info(f"Discovered {len(jobs)} jobs from LinkedIn")
-            return jobs
+            logger.info(f"Discovered {len(new_jobs)} jobs from LinkedIn")
+            return new_jobs
 
         except Exception as e:
             logger.error(f"LinkedIn discovery error: {e}")
@@ -230,8 +253,19 @@ class JobAutomationOrchestrator:
                 # Add to deduplication cache
                 self.deduplicator.add_job(company, role)
 
-                # Transition to CLI_PENDING for approval
-                self.state_machine.update_state(job_id, JobState.CLI_PENDING)
+                # Handle based on source and whether it's new
+                source = job.get("source", "unknown")
+                is_new = job.get("is_new", False)
+                
+                if source == "linkedin" and is_new:
+                    # New LinkedIn job - automatically send email to recruiter
+                    logger.info(f"💼 Auto-sending email for new LinkedIn job: {company}/{role}")
+                    self.state_machine.update_state(job_id, JobState.PROCESSING)
+                    await self.send_email_for_linkedin_job(new_job)
+                    self.state_machine.update_state(job_id, JobState.COMPLETED)
+                else:
+                    # Existing job or email - requires approval
+                    self.state_machine.update_state(job_id, JobState.CLI_PENDING)
 
         except Exception as e:
             logger.error(f"Job detection error: {e}")
@@ -344,6 +378,70 @@ class JobAutomationOrchestrator:
         # 2. Navigate to application URL
         # 3. Fill form with prepared data
         # 4. Submit application
+
+    async def send_email_for_linkedin_job(self, job) -> None:
+        """Send email to recruiter for new LinkedIn job postings."""
+        try:
+            if not self.metadata:
+                logger.warning("Metadata not loaded, skipping email to recruiter")
+                return
+
+            if not self.gmail_mcp or not self.gmail_mcp.is_connected:
+                logger.error("Gmail MCP not connected, cannot send email")
+                return
+
+            logger.info(f"📧 Composing email for LinkedIn job: {job.company}/{job.role}")
+            
+            # Generate personalized email using Ollama
+            prompt = f"""
+Generate a professional job inquiry email for:
+
+Company: {job.company}
+Position: {job.role}
+Job URL: {job.metadata.get('url', 'N/A')}
+
+Your Profile:
+- Name: {self.metadata.personal_info.name}
+- Email: {self.metadata.personal_info.email}
+- Phone: {self.metadata.personal_info.phone}
+- Skills: {', '.join(self.metadata.skills)}
+
+Write a compelling 2-3 paragraph email expressing strong interest in the position,
+highlighting relevant skills and experience, and requesting an opportunity to discuss further.
+Include a professional closing with signature.
+Start with "Dear Hiring Manager," and end with your name.
+"""
+
+            email_body = await self.ollama_client.generate(
+                prompt,
+                system="You are a professional job seeker writing persuasive emails to recruiters. "
+                "Be enthusiastic, professional, and concise.",
+            )
+
+            logger.info(f"Generated email: {len(email_body)} chars")
+
+            # Extract company domain to find recruiter email
+            # In production, this would use LinkedIn scraping or job portal data
+            company_domain = job.metadata.get("company_domain", f"{job.company.lower().replace(' ', '')}.com")
+            recruiter_email = f"careers@{company_domain}"
+            
+            # Send email via Gmail
+            subject = f"Inquiry: {job.role} Position at {job.company}"
+            
+            send_result = await self.gmail_mcp.send_email_reply(
+                to_address=recruiter_email,
+                subject=subject,
+                body=email_body,
+                original_message_id=None,
+            )
+
+            if send_result["status"] == "success":
+                logger.info(f"✅ Email sent successfully to {recruiter_email} for {job.company} - {job.role}")
+            else:
+                logger.error(f"❌ Failed to send email to recruiter: {send_result.get('error')}")
+
+        except Exception as e:
+            logger.error(f"Error sending email for LinkedIn job: {e}")
 
     def _extract_company_from_email(self, email: Dict[str, Any]) -> str:
         """Extract company name from email subject/body using heuristics."""
@@ -509,6 +607,7 @@ and requesting next steps. Be professional and enthusiastic. Do NOT include gree
                 "company": self._extract_company_from_email(email),
                 "role": self._extract_role_from_email(email),
                 "message": email.get("body", "")[:200],
+                "msg_id": email.get("msg_id"),  # Store msg_id for marking as read
             }
             
             # Check for duplicates
@@ -532,8 +631,38 @@ and requesting next steps. Be professional and enthusiastic. Do NOT include gree
             # Add to deduplication cache
             self.deduplicator.add_job(company, role)
             
-            # Transition to CLI_PENDING for approval
-            self.state_machine.update_state(opportunity["job_id"], JobState.CLI_PENDING)
+            # Automatically send reply to new emails arriving after agent startup
+            if self.agent_start_time:
+                # Ensure email_timestamp is converted to int (handle both string and int)
+                email_timestamp_raw = opportunity.get("timestamp", 0)
+                try:
+                    email_timestamp = int(email_timestamp_raw) if email_timestamp_raw else 0
+                except (ValueError, TypeError):
+                    email_timestamp = 0
+                
+                agent_start_timestamp = int(self.agent_start_time.timestamp())
+                
+                if email_timestamp > 0 and email_timestamp >= agent_start_timestamp:
+                    # Email arrived after agent startup - auto-reply
+                    logger.info(f"📧 Auto-replying to new email from {opportunity.get('from', 'Unknown')}")
+                    self.state_machine.update_state(opportunity["job_id"], JobState.PROCESSING)
+                    await self.handle_email_response(new_job)
+                    # Mark email as read after successfully replying
+                    if opportunity.get("msg_id"):
+                        await self.gmail_mcp.mark_email_as_read(opportunity["msg_id"])
+                    self.state_machine.update_state(opportunity["job_id"], JobState.COMPLETED)
+                else:
+                    # Email existed before startup - requires approval
+                    self.state_machine.update_state(opportunity["job_id"], JobState.CLI_PENDING)
+            else:
+                # Agent just started, treat as new and auto-reply
+                logger.info(f"📧 Auto-replying to email from {opportunity.get('from', 'Unknown')}")
+                self.state_machine.update_state(opportunity["job_id"], JobState.PROCESSING)
+                await self.handle_email_response(new_job)
+                # Mark email as read after successfully replying
+                if opportunity.get("msg_id"):
+                    await self.gmail_mcp.mark_email_as_read(opportunity["msg_id"])
+                self.state_machine.update_state(opportunity["job_id"], JobState.COMPLETED)
             
             logger.info(f"✨ New job opportunity detected: {company} - {role}")
             
@@ -546,6 +675,10 @@ and requesting next steps. Be professional and enthusiastic. Do NOT include gree
             logger.info("=" * 70)
             logger.info("🤖 JOB AUTOMATION ORCHESTRATOR STARTING")
             logger.info("=" * 70)
+            
+            # Set agent start time for tracking new emails/jobs
+            self.agent_start_time = datetime.utcnow()
+            logger.info(f"Agent start time: {self.agent_start_time.isoformat()}")
 
             # Initialize MCP servers FIRST (before metadata)
             logger.info("Initializing MCP servers...")

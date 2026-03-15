@@ -11,6 +11,9 @@ from utils.cookie_store import CookieStore
 from tools.fetch_posts import fetch_job_posts
 from tools.extract_recruiter_email import extract_recruiter_email
 from tools.session_manager import manage_session
+from dotenv import load_dotenv
+load_dotenv()
+
 
 
 # Initialize FastMCP server

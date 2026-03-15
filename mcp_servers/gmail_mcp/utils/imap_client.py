@@ -157,6 +157,18 @@ class GmailIMAPClient:
 
         return None
 
+    def mark_as_read(self, msg_id: str, mailbox: str = "INBOX") -> bool:
+        """Mark an email as read by message ID."""
+        try:
+            self.imap.select(mailbox)
+            # msg_id could be the message number (bytes) from IMAP search
+            _, _ = self.imap.store(msg_id, "+FLAGS", "\\Seen")
+            logger.debug(f"Marked email {msg_id} as read")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to mark email {msg_id} as read: {e}")
+            return False
+
     def close(self) -> None:
         """Close IMAP connection."""
         if self.imap:

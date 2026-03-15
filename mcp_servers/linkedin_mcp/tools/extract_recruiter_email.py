@@ -3,6 +3,8 @@
 from typing import Dict, Optional
 from loguru import logger
 import re
+from dotenv import load_dotenv
+load_dotenv()
 
 
 async def extract_recruiter_email(

@@ -2,6 +2,8 @@
 
 from typing import Dict
 from loguru import logger
+from dotenv import load_dotenv
+load_dotenv()
 
 
 async def manage_session(

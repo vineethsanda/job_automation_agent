@@ -245,6 +245,48 @@ class GmailMCPClient:
                 "otp": None
             }
 
+    async def mark_email_as_read(self, msg_id: str, mailbox: str = "INBOX") -> Dict[str, Any]:
+        """
+        Mark an email as read.
+        
+        Args:
+            msg_id: Message ID to mark as read
+            mailbox: Mailbox name (default: INBOX)
+            
+        Returns:
+            Dictionary with operation status
+        """
+        try:
+            if not self.is_connected or not self.imap_client:
+                logger.error("Gmail client not connected")
+                return {
+                    "status": "error",
+                    "error": "Not connected to Gmail"
+                }
+            
+            success = self.imap_client.mark_as_read(msg_id, mailbox)
+            
+            if success:
+                logger.debug(f"✅ Email {msg_id} marked as read")
+                return {
+                    "status": "success",
+                    "msg_id": msg_id,
+                    "marked_as_read": True
+                }
+            else:
+                return {
+                    "status": "failed",
+                    "msg_id": msg_id,
+                    "error": "Failed to mark email as read"
+                }
+                
+        except Exception as e:
+            logger.error(f"Exception marking email as read: {e}")
+            return {
+                "status": "error",
+                "error": str(e)
+            }
+
     async def disconnect(self) -> None:
         """Disconnect from Gmail servers."""
         try:

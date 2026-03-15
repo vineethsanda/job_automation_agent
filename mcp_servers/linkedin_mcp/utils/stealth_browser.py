@@ -6,6 +6,8 @@ from typing import Optional, Dict, List
 from pathlib import Path
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 from loguru import logger
+from dotenv import load_dotenv
+load_dotenv()
 
 
 class StealthBrowser:

@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 from loguru import logger
+from dotenv import load_dotenv
+load_dotenv()
 
 
 class CookieStore:
